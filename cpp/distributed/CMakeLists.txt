@@ -1,23 +1,19 @@
 cmake_minimum_required(VERSION 3.1 FATAL_ERROR)
 project(dist-mnist)
 
+
+#add_subdirectory(./gloo)
+include_directories(./gloo)
+
 find_package(Torch REQUIRED)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 
-find_package(MPI REQUIRED)
-
-include_directories(SYSTEM ${MPI_C_INCLUDE_PATH} ${MPI_CXX_INCLUDE_PATH})
-
-add_executable(dist-mnist dist-mnist.cpp)
-target_link_libraries(dist-mnist ${TORCH_LIBRARIES})
-target_link_libraries(dist-mnist ${MPI_LIBRARIES})
-target_link_libraries(dist-mnist ${CMAKE_PREFIX_PATH}/lib/libc10d.a)
-
-if(MPI_COMPILE_FLAGS)
-  set_target_properties(dist-mnist PROPERTIES
-    COMPILE_FLAGS "${MPI_COMPILE_FLAGS}")
-endif()
-
-if(MPI_LINK_FLAGS)
-  set_target_properties(dist-mnist PROPERTIES
-    LINK_FLAGS "${MPI_LINK_FLAGS}")
-endif()
+set(program_name example)
+#set(program_name example)
+set(src example.cpp)
+#set(src example.cpp)
+#add_executable(dist-mnist dist-mnist.cpp)
+add_executable(${program_name} ${src})
+target_link_libraries(${program_name} ${TORCH_LIBRARIES} /data/build/examples/cpp/distributed/libtorch/lib/libc10d.a /data/build/examples/cpp/distributed/libtorch/lib/libgloo.a)
+#target_link_libraries(${program_name} ${TORCH_LIBRARIES})
+set_property(TARGET ${program_name} PROPERTY CXX_STANDARD 14)

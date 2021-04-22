@@ -1,5 +1,10 @@
-#include <c10d/ProcessGroupMPI.hpp>
+#include <c10d/ProcessGroupGloo.hpp>
+#include <c10d/TCPStore.hpp>
+#include <c10d/PrefixStore.hpp>
+#include <c10d/FileStore.hpp>
 #include <torch/torch.h>
+
+#include <memory>
 #include <iostream>
 
 // Define a Convolutional Module
@@ -35,25 +40,43 @@ struct Model : torch::nn::Module {
 };
 
 void waitWork(
-    std::shared_ptr<c10d::ProcessGroupMPI> pg,
-    std::vector<std::shared_ptr<c10d::ProcessGroup::Work>> works) {
+    std::shared_ptr<c10d::ProcessGroupGloo> pg,
+    std::vector<c10::intrusive_ptr<c10d::ProcessGroup::Work>> works) {
   for (auto& work : works) {
     try {
       work->wait();
     } catch (const std::exception& ex) {
       std::cerr << "Exception received: " << ex.what() << std::endl;
-      pg->abort();
+      //pg->abort();
     }
   }
 }
 
 int main(int argc, char* argv[]) {
-  // Creating MPI Process Group
-  auto pg = c10d::ProcessGroupMPI::createProcessGroupMPI();
+  auto master_address = getenv("MASTER_ADDR");
+  auto master_port = atoi(getenv("MASTER_PORT"));
+  auto size = atoi(getenv("SIZE"));
+  auto rank = atoi(getenv("RANK"));
 
-  // Retrieving MPI environment variables
-  auto numranks = pg->getSize();
-  auto rank = pg->getRank();
+  std::cout << "master: " << master_address << std::endl;
+  std::cout << "port: " << master_port << std::endl;
+  std::cout << "world size: " << size << std::endl;
+  std::cout << "rank: " << rank << std::endl;
+#if 0
+  auto tcp_store = c10::make_intrusive<c10d::TCPStore>(master_address, master_port, size, rank == 0);
+  auto store = c10::make_intrusive<c10d::PrefixStore>("", tcp_store);
+#endif
+
+  auto store = c10::make_intrusive<c10d::FileStore>("/tmp/c10d_example", size);
+
+  auto options = c10::make_intrusive<c10d::ProcessGroupGloo::Options>();
+  options->timeout = std::chrono::milliseconds(1000);
+  options->devices.push_back(c10d::ProcessGroupGloo::createDeviceForHostname(master_address));
+
+  std::cout << "create process group gloo  ...\n";
+  auto pg = std::shared_ptr<c10d::ProcessGroupGloo>(new c10d::ProcessGroupGloo(store, rank, size, options));
+
+  std::cout << "training ...\n";
 
   // TRAINING
   // Read train dataset
@@ -65,14 +88,14 @@ int main(int argc, char* argv[]) {
 
   // Distributed Random Sampler
   auto data_sampler = torch::data::samplers::DistributedRandomSampler(
-      train_dataset.size().value(), numranks, rank, false);
+      train_dataset.size().value(), size, rank, false);
 
-  auto num_train_samples_per_proc = train_dataset.size().value() / numranks;
+  auto num_train_samples_per_proc = train_dataset.size().value() / size;
 
   // Generate dataloader
   auto total_batch_size = 64;
   auto batch_size_per_proc =
-      total_batch_size / numranks; // effective batch size in each processor
+      total_batch_size / size; // effective batch size in each processor
   auto data_loader = torch::data::make_data_loader(
       std::move(train_dataset), data_sampler, batch_size_per_proc);
 
@@ -88,6 +111,7 @@ int main(int argc, char* argv[]) {
   // Number of epochs
   size_t num_epochs = 10;
 
+  std::cout << "begin epoch ...\n";
   for (size_t epoch = 1; epoch <= num_epochs; ++epoch) {
     size_t num_correct = 0;
 
@@ -115,7 +139,7 @@ int main(int argc, char* argv[]) {
       // since this synchronizes parameters after backward pass while DDP
       // overlaps synchronizing parameters and computing gradients in backward
       // pass
-      std::vector<std::shared_ptr<::c10d::ProcessGroup::Work>> works;
+      std::vector<c10::intrusive_ptr<c10d::ProcessGroup::Work>> works;
       for (auto& param : model->named_parameters()) {
         std::vector<torch::Tensor> tmp = {param.value().grad()};
         auto work = pg->allreduce(tmp);
@@ -125,7 +149,7 @@ int main(int argc, char* argv[]) {
       waitWork(pg, works);
 
       for (auto& param : model->named_parameters()) {
-        param.value().grad().data() = param.value().grad().data() / numranks;
+        param.value().grad().data() = param.value().grad().data() / size;
       }
 
       // Update parameters
