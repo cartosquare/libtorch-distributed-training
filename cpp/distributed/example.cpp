@@ -21,6 +21,7 @@ int main() {
     auto master_port = atoi(getenv("MASTER_PORT"));
     int rank = atoi(getenv("RANK"));
     int size = atoi(getenv("SIZE"));
+    std::string backend = getenv("BACKEND");
 
     std::shared_ptr<c10d::ProcessGroup> pg;
 
@@ -30,8 +31,6 @@ int main() {
     std::cout << "master port: " << master_port << std::endl;
     auto store = c10::make_intrusive<TCPStore>(master_addr, master_port, size, rank == 0);
 
-    std::string backend = "nccl";
-    
     if (backend == "gloo") {
         c10d::ProcessGroupGloo::Options options;
         options.timeout = std::chrono::milliseconds(100000);
@@ -39,7 +38,7 @@ int main() {
         char* ifnameEnv = getenv("GLOO_SOCKET_IFNAME");
         if (ifnameEnv) {
             for (const auto& iface : split(',', ifnameEnv)) {
-                options.devices.push_back(c10d::ProcessGroupGloo::createDeviceForInterface(iface))
+                options.devices.push_back(c10d::ProcessGroupGloo::createDeviceForInterface(iface));
             }
         } else {
             // If no hostname is specified, this function looks up
@@ -49,10 +48,14 @@ int main() {
         }
 
         std::cout << "#devices: " << options.devices.size() << std::endl;
+
+        pg = std::shared_ptr<ProcessGroup>(new ProcessGroupGloo(store, rank, size, options));
+    } else {
+        std::cout << "nccl process group\n";
+        pg = std::shared_ptr<ProcessGroup>(new ProcessGroupNCCL(store, rank, size));
     }
 
-    pg = std::make_shared<ProcessGroup>(new ProcessGroupGloo(store, rank, size, options));
-    
+
     const auto ntensors = 10;
     std::vector<at::Tensor> tensors;
     for(auto i = 0; i < ntensors; ++i) {
@@ -64,7 +67,7 @@ int main() {
     std::vector<c10::intrusive_ptr<ProcessGroup::Work>> pending;
     for (auto i = 0; i < ntensors; ++i) {
         std::vector<at::Tensor> tmp = {tensors[i]};
-        pending.push_back(pg.allreduce(tmp));
+        pending.push_back(pg->allreduce(tmp));
     }
 
     // wait for work to complete

@@ -1,7 +1,6 @@
 #include <c10d/ProcessGroupGloo.hpp>
+#include <c10d/ProcessGroupNCCL.hpp>
 #include <c10d/TCPStore.hpp>
-#include <c10d/PrefixStore.hpp>
-#include <c10d/FileStore.hpp>
 #include <torch/torch.h>
 
 #include <memory>
@@ -40,7 +39,7 @@ struct Model : torch::nn::Module {
 };
 
 void waitWork(
-    std::shared_ptr<c10d::ProcessGroupGloo> pg,
+    std::shared_ptr<c10d::ProcessGroup> pg,
     std::vector<c10::intrusive_ptr<c10d::ProcessGroup::Work>> works) {
   for (auto& work : works) {
     try {
@@ -52,35 +51,67 @@ void waitWork(
   }
 }
 
+std::vector<std::string> split(char separator, const std::string& string) {
+  std::vector<std::string> pieces;
+  std::stringstream ss(string);
+  std::string item;
+  while (std::getline(ss, item, separator)) {
+    pieces.push_back(std::move(item));
+  }
+  return pieces;
+}
+
 int main(int argc, char* argv[]) {
-  auto master_address = getenv("MASTER_ADDR");
+  auto master_addr = getenv("MASTER_ADDR");
   auto master_port = atoi(getenv("MASTER_PORT"));
   auto size = atoi(getenv("SIZE"));
   auto rank = atoi(getenv("RANK"));
+  std::string backend = getenv("BACKEND");
+  std::string device = getenv("DEVICE");
+  
+  torch::DeviceType device_type = torch::kCPU;
+  if (backend == "nccl") {
+    device = "cuda";
+  }
+  if (device == "cuda") {
+    device_type = torch::kCUDA;
+  }
 
-  std::cout << "master: " << master_address << std::endl;
+  std::cout << "master: " << master_addr << std::endl;
   std::cout << "port: " << master_port << std::endl;
   std::cout << "world size: " << size << std::endl;
   std::cout << "rank: " << rank << std::endl;
-#if 0
-  auto tcp_store = c10::make_intrusive<c10d::TCPStore>(master_address, master_port, size, rank == 0);
-  auto store = c10::make_intrusive<c10d::PrefixStore>("", tcp_store);
-#endif
+  std::cout << "backend: " << backend << std::endl;
+  std::cout << "device: " << device_type << std::endl;
 
-  auto store = c10::make_intrusive<c10d::FileStore>("/tmp/c10d_example", size);
+  std::shared_ptr<c10d::ProcessGroup> pg;
+  auto store = c10::make_intrusive<c10d::TCPStore>(master_addr, master_port, size, rank == 0);
+  if (backend == "gloo") {
+    c10d::ProcessGroupGloo::Options options;
+    options.timeout = std::chrono::milliseconds(100000);
 
-  auto options = c10::make_intrusive<c10d::ProcessGroupGloo::Options>();
-  options->timeout = std::chrono::milliseconds(1000);
-  options->devices.push_back(c10d::ProcessGroupGloo::createDeviceForHostname(master_address));
+    char* ifnameEnv = getenv("GLOO_SOCKET_IFNAME");
+    if (ifnameEnv) {
+        for (const auto& iface : split(',', ifnameEnv)) {
+            options.devices.push_back(c10d::ProcessGroupGloo::createDeviceForInterface(iface));
+        }
+    } else {
+        // If no hostname is specified, this function looks up
+        // the machine's hostname and returns a device instance
+        // associated with the address that the hostname resolves to.
+        options.devices.push_back(c10d::ProcessGroupGloo::createDefaultDevice());
+    }
 
-  std::cout << "create process group gloo  ...\n";
-  auto pg = std::shared_ptr<c10d::ProcessGroupGloo>(new c10d::ProcessGroupGloo(store, rank, size, options));
-
-  std::cout << "training ...\n";
+    std::cout << "#devices: " << options.devices.size() << std::endl;
+    pg = std::shared_ptr<c10d::ProcessGroup>(new c10d::ProcessGroupGloo(store, rank, size, options));
+  } else {
+    std::cout << "nccl progress group\n";
+    pg = std::shared_ptr<c10d::ProcessGroup>(new c10d::ProcessGroupNCCL(store, rank, size));
+  }
 
   // TRAINING
   // Read train dataset
-  const char* kDataRoot = "../data";
+  const char* kDataRoot = "../data/mnist";
   auto train_dataset =
       torch::data::datasets::MNIST(kDataRoot)
           .map(torch::data::transforms::Normalize<>(0.1307, 0.3081))
@@ -103,6 +134,7 @@ int main(int argc, char* argv[]) {
   torch::manual_seed(0);
 
   auto model = std::make_shared<Model>();
+  model->to(device_type);
 
   auto learning_rate = 1e-2;
 
@@ -120,8 +152,8 @@ int main(int argc, char* argv[]) {
       auto op = batch.target.squeeze();
 
       // convert to required formats
-      ip = ip.to(torch::kF32);
-      op = op.to(torch::kLong);
+      ip = ip.to(torch::kF32).to(device_type);
+      op = op.to(torch::kLong).to(device_type);
 
       // Reset gradients
       model->zero_grad();
@@ -187,8 +219,8 @@ int main(int argc, char* argv[]) {
       auto op = batch.target.squeeze();
 
       // convert to required format
-      ip = ip.to(torch::kF32);
-      op = op.to(torch::kLong);
+      ip = ip.to(torch::kF32).to(device_type);
+      op = op.to(torch::kLong).to(device_type);
 
       auto prediction = model->forward(ip);
 
